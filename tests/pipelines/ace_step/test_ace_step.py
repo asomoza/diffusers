@@ -14,6 +14,7 @@
 
 import unittest
 
+import numpy as np
 import torch
 from transformers import AutoTokenizer, BertConfig, BertModel
 
@@ -135,6 +136,11 @@ class AceStepPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
         assert audio.ndim == 2
 
+        audio_slice = audio.flatten().cpu().numpy()
+        expected_slice = np.array([-0.0998, -0.1473, 0.0846, 0.0040, -0.2663, -0.3184])
+        max_diff = np.abs(expected_slice - audio_slice).max()
+        assert max_diff < 1e-2, f"Audio slice mismatch: {max_diff:.6f}"
+
     def test_ace_step_with_lyrics(self):
         device = "cpu"
         components = self.get_dummy_components()
@@ -148,6 +154,11 @@ class AceStepPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         audio = output.audios[0]
 
         assert audio.ndim == 2
+
+        audio_slice = audio.flatten().cpu().numpy()
+        expected_slice = np.array([-0.0953, -0.1477, 0.0907, 0.0120, -0.2688, -0.3250])
+        max_diff = np.abs(expected_slice - audio_slice).max()
+        assert max_diff < 1e-2, f"Audio slice mismatch: {max_diff:.6f}"
 
     def test_ace_step_negative_prompt(self):
         device = "cpu"
@@ -186,6 +197,44 @@ class AceStepPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             num_waveforms_per_prompt=num_waveforms_per_prompt,
         ).audios
         assert audios.shape[0] == num_waveforms_per_prompt
+
+    def test_ace_step_turbo_sigmas(self):
+        device = "cpu"
+        components = self.get_dummy_components()
+        pipe = AceStepPipeline(**components)
+        pipe = pipe.to(torch_device)
+        pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        inputs["turbo_sigmas"] = [0.75, 0.25]
+        output = pipe(**inputs)
+        audio = output.audios[0]
+
+        assert audio.ndim == 2
+
+        audio_slice = audio.flatten().cpu().numpy()
+        expected_slice = np.array([-0.1127, -0.1587, 0.0662, -0.0106, -0.2696, -0.3235])
+        max_diff = np.abs(expected_slice - audio_slice).max()
+        assert max_diff < 1e-2, f"Audio slice mismatch: {max_diff:.6f}"
+
+    def test_ace_step_vae_tiling(self):
+        device = "cpu"
+        components = self.get_dummy_components()
+        pipe = AceStepPipeline(**components)
+        pipe = pipe.to(torch_device)
+        pipe.set_progress_bar_config(disable=None)
+
+        # Use longer duration so the latent sequence exceeds chunk_size and forces actual chunking.
+        # vae hop_length=2, sampling_rate=4 => 10s gives 20 latent frames.
+        # chunk_size=8, overlap=2 => stride=4 => 5 chunks over 20 frames.
+        pipe.enable_vae_tiling(chunk_size=8, overlap=2)
+        inputs = self.get_dummy_inputs(device)
+        inputs["audio_duration_in_s"] = 10.0
+        output = pipe(**inputs)
+        audio = output.audios[0]
+
+        assert audio.ndim == 2
+        assert audio.shape[-1] > 0
 
     def test_ace_step_latent_output(self):
         device = "cpu"
