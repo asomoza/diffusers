@@ -203,13 +203,13 @@ def convert_time_embed_key(key: str, prefix: str) -> str | None:
     # time_proj is separate in diffusers
     if key.startswith("time_proj."):
         proj_name = "time_proj" if prefix == "time_embed" else "time_proj_r"
-        return f"{proj_name}.{key[len('time_proj.'):]}"
+        return f"{proj_name}.{key[len('time_proj.') :]}"
 
     # linear_1, linear_2 → time_embed.1.linear_1, time_embed.1.linear_2 (in nn.Sequential[1] = TimestepEmbedding)
     if key.startswith("linear_1."):
-        return f"{prefix}.1.linear_1.{key[len('linear_1.'):]}"
+        return f"{prefix}.1.linear_1.{key[len('linear_1.') :]}"
     if key.startswith("linear_2."):
-        return f"{prefix}.1.linear_2.{key[len('linear_2.'):]}"
+        return f"{prefix}.1.linear_2.{key[len('linear_2.') :]}"
 
     return None
 
@@ -222,15 +222,15 @@ def convert_dit_layer_key(layer_idx: str, key: str) -> str | None:
 
     # self_attn_norm → norm1
     if key.startswith("self_attn_norm."):
-        return f"transformer_blocks.{layer_idx}.norm1.{key[len('self_attn_norm.'):]}"
+        return f"transformer_blocks.{layer_idx}.norm1.{key[len('self_attn_norm.') :]}"
 
     # cross_attn_norm → norm2
     if key.startswith("cross_attn_norm."):
-        return f"transformer_blocks.{layer_idx}.norm2.{key[len('cross_attn_norm.'):]}"
+        return f"transformer_blocks.{layer_idx}.norm2.{key[len('cross_attn_norm.') :]}"
 
     # mlp_norm → norm3
     if key.startswith("mlp_norm."):
-        return f"transformer_blocks.{layer_idx}.norm3.{key[len('mlp_norm.'):]}"
+        return f"transformer_blocks.{layer_idx}.norm3.{key[len('mlp_norm.') :]}"
 
     # self_attn.{q,k,v,o}_proj → attn1.to_{q,k,v,out.0}
     m = re.match(r"self_attn\.([qkvo])_proj\.(.*)", key)
@@ -266,7 +266,7 @@ def convert_dit_layer_key(layer_idx: str, key: str) -> str | None:
 
     # mlp.down_proj → ff.net.2
     if key.startswith("mlp.down_proj."):
-        return f"transformer_blocks.{layer_idx}.ff.net.2.{key[len('mlp.down_proj.'):]}"
+        return f"transformer_blocks.{layer_idx}.ff.net.2.{key[len('mlp.down_proj.') :]}"
 
     # mlp.gate_proj / up_proj → fused (skip, handled separately)
     m = re.match(r"mlp\.(gate_proj|up_proj)\.(.*)", key)
@@ -318,10 +318,7 @@ def convert_checkpoint(state_dict: dict) -> dict:
             new_key = convert_decoder_key(key)
 
         # Skip tokenizer/detokenizer/rotary_emb (not needed in diffusers model)
-        elif any(
-            key.startswith(p)
-            for p in ["tokenizer.", "detokenizer.", "decoder.rotary_emb."]
-        ):
+        elif any(key.startswith(p) for p in ["tokenizer.", "detokenizer.", "decoder.rotary_emb."]):
             continue
         elif any(
             key.startswith(p)
@@ -394,9 +391,7 @@ def convert_checkpoint(state_dict: dict) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert ACE-Step checkpoint to diffusers format"
-    )
+    parser = argparse.ArgumentParser(description="Convert ACE-Step checkpoint to diffusers format")
     parser.add_argument(
         "--checkpoint_path",
         type=str,
@@ -459,9 +454,7 @@ def main():
         # Try to find safetensors or bin file
         from safetensors.torch import load_file
 
-        safetensor_files = [
-            f for f in os.listdir(ckpt_path) if f.endswith(".safetensors")
-        ]
+        safetensor_files = [f for f in os.listdir(ckpt_path) if f.endswith(".safetensors")]
         if safetensor_files:
             state_dict = {}
             for sf_file in safetensor_files:
@@ -470,9 +463,7 @@ def main():
             bin_files = [f for f in os.listdir(ckpt_path) if f.endswith(".bin")]
             state_dict = {}
             for bf in bin_files:
-                state_dict.update(
-                    torch.load(os.path.join(ckpt_path, bf), map_location="cpu")
-                )
+                state_dict.update(torch.load(os.path.join(ckpt_path, bf), map_location="cpu"))
     else:
         if ckpt_path.endswith(".safetensors"):
             from safetensors.torch import load_file
@@ -519,9 +510,7 @@ def main():
             silence_latent_path = candidate
     if silence_latent_path is None:
         # Check parent directory
-        parent = (
-            os.path.dirname(ckpt_path) if not os.path.isdir(ckpt_path) else ckpt_path
-        )
+        parent = os.path.dirname(ckpt_path) if not os.path.isdir(ckpt_path) else ckpt_path
         candidate = os.path.join(parent, "silence_latent.pt")
         if os.path.exists(candidate):
             silence_latent_path = candidate
@@ -530,16 +519,11 @@ def main():
         print(f"Loading silence_latent from {silence_latent_path}...")
         silence_latent = torch.load(silence_latent_path, map_location="cpu")
         # Original shape: [1, channels, time] → transpose to [1, time, channels]
-        if (
-            silence_latent.ndim == 3
-            and silence_latent.shape[1] < silence_latent.shape[2]
-        ):
+        if silence_latent.ndim == 3 and silence_latent.shape[1] < silence_latent.shape[2]:
             silence_latent = silence_latent.transpose(1, 2)
         new_state_dict["silence_latent"] = silence_latent
     else:
-        print(
-            "WARNING: silence_latent.pt not found. The model will use zeros as the default silence latent."
-        )
+        print("WARNING: silence_latent.pt not found. The model will use zeros as the default silence latent.")
 
     # Load converted weights
     transformer.load_state_dict(new_state_dict, strict=True)
@@ -550,12 +534,8 @@ def main():
     print("Loading text encoder and tokenizer...")
     from transformers import AutoModel, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.text_encoder_path, trust_remote_code=True
-    )
-    text_encoder = AutoModel.from_pretrained(
-        args.text_encoder_path, trust_remote_code=True, torch_dtype=dtype
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_path, trust_remote_code=True)
+    text_encoder = AutoModel.from_pretrained(args.text_encoder_path, trust_remote_code=True, torch_dtype=dtype)
 
     # 5. Load or create VAE
     print("Loading VAE...")

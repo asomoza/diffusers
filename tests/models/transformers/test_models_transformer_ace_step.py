@@ -92,9 +92,7 @@ class AceStepTransformer1DTesterConfig(BaseModelTesterConfig):
                 generator=self.generator,
                 device=torch_device,
             ),
-            "encoder_attention_mask": torch.ones(
-                batch_size, encoder_seq_len, dtype=torch.long, device=torch_device
-            ),
+            "encoder_attention_mask": torch.ones(batch_size, encoder_seq_len, dtype=torch.long, device=torch_device),
         }
 
 

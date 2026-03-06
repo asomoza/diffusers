@@ -15,7 +15,6 @@
 from typing import Callable
 
 import torch
-import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
@@ -129,23 +128,16 @@ class AceStepPipeline(DiffusionPipeline):
         if prompt is None:
             raise ValueError("`prompt` must be provided.")
         if not isinstance(prompt, (str, list)):
-            raise ValueError(
-                f"`prompt` must be a string or list of strings, but got {type(prompt)}."
-            )
+            raise ValueError(f"`prompt` must be a string or list of strings, but got {type(prompt)}.")
 
         if audio_duration_in_s is not None and audio_duration_in_s <= 0:
-            raise ValueError(
-                f"`audio_duration_in_s` must be positive, but got {audio_duration_in_s}."
-            )
+            raise ValueError(f"`audio_duration_in_s` must be positive, but got {audio_duration_in_s}.")
 
         if num_inference_steps is not None and num_inference_steps <= 0:
-            raise ValueError(
-                f"`num_inference_steps` must be positive, but got {num_inference_steps}."
-            )
+            raise ValueError(f"`num_inference_steps` must be positive, but got {num_inference_steps}.")
 
         if callback_on_step_end_tensor_inputs is not None and not all(
-            k in self._callback_tensor_inputs
-            for k in callback_on_step_end_tensor_inputs
+            k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
         ):
             raise ValueError(
                 f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found "
@@ -210,19 +202,13 @@ class AceStepPipeline(DiffusionPipeline):
         input_ids = text_inputs.input_ids.to(device)
         attention_mask = text_inputs.attention_mask.to(device)
 
-        text_encoder_output = self.text_encoder(
-            input_ids=input_ids, attention_mask=attention_mask
-        )
+        text_encoder_output = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
         prompt_embeds = text_encoder_output.last_hidden_state
 
         # Duplicate for multiple waveforms per prompt
         if num_waveforms_per_prompt > 1:
-            prompt_embeds = prompt_embeds.repeat_interleave(
-                num_waveforms_per_prompt, dim=0
-            )
-            attention_mask = attention_mask.repeat_interleave(
-                num_waveforms_per_prompt, dim=0
-            )
+            prompt_embeds = prompt_embeds.repeat_interleave(num_waveforms_per_prompt, dim=0)
+            attention_mask = attention_mask.repeat_interleave(num_waveforms_per_prompt, dim=0)
 
         return prompt_embeds, attention_mask
 
@@ -240,12 +226,8 @@ class AceStepPipeline(DiffusionPipeline):
             lyric_embeds = torch.zeros(batch_size, 1, embed_dim, device=device)
             lyric_mask = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
             if num_waveforms_per_prompt > 1:
-                lyric_embeds = lyric_embeds.repeat_interleave(
-                    num_waveforms_per_prompt, dim=0
-                )
-                lyric_mask = lyric_mask.repeat_interleave(
-                    num_waveforms_per_prompt, dim=0
-                )
+                lyric_embeds = lyric_embeds.repeat_interleave(num_waveforms_per_prompt, dim=0)
+                lyric_mask = lyric_mask.repeat_interleave(num_waveforms_per_prompt, dim=0)
             return lyric_embeds, lyric_mask
 
         if isinstance(lyrics, str):
@@ -266,9 +248,7 @@ class AceStepPipeline(DiffusionPipeline):
         lyric_embeds = embedding_layer(lyric_ids)
 
         if num_waveforms_per_prompt > 1:
-            lyric_embeds = lyric_embeds.repeat_interleave(
-                num_waveforms_per_prompt, dim=0
-            )
+            lyric_embeds = lyric_embeds.repeat_interleave(num_waveforms_per_prompt, dim=0)
             lyric_mask = lyric_mask.repeat_interleave(num_waveforms_per_prompt, dim=0)
 
         return lyric_embeds, lyric_mask
@@ -292,9 +272,7 @@ class AceStepPipeline(DiffusionPipeline):
         Returns:
             Tuple of (timbre_hidden_states, timbre_mask).
         """
-        timbre_hidden_states = self._silence_latent[:, :timbre_ref_length, :].expand(
-            batch_size, -1, -1
-        )
+        timbre_hidden_states = self._silence_latent[:, :timbre_ref_length, :].expand(batch_size, -1, -1)
         timbre_hidden_states = timbre_hidden_states.to(device)
         timbre_mask = None  # No padding in the silence latent reference
         return timbre_hidden_states, timbre_mask
@@ -313,9 +291,7 @@ class AceStepPipeline(DiffusionPipeline):
         latents: torch.Tensor | None = None,
         output_type: str | None = "pt",
         return_dict: bool = True,
-        callback_on_step_end: (
-            Callable | PipelineCallback | MultiPipelineCallbacks | None
-        ) = None,
+        callback_on_step_end: (Callable | PipelineCallback | MultiPipelineCallbacks | None) = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         shift: float = 3.0,
         turbo_sigmas: list[float] | None = None,
@@ -440,9 +416,7 @@ class AceStepPipeline(DiffusionPipeline):
             if isinstance(lyrics, str):
                 formatted_lyrics = [self._format_lyrics(lyrics, lyric_language)]
             else:
-                formatted_lyrics = [
-                    self._format_lyrics(l, lyric_language) for l in lyrics
-                ]
+                formatted_lyrics = [self._format_lyrics(l, lyric_language) for l in lyrics]
 
         lyric_embeds, lyric_mask = self.encode_lyrics(
             formatted_lyrics,
@@ -481,11 +455,7 @@ class AceStepPipeline(DiffusionPipeline):
 
         # 8. Prepare context using silence latent (not zeros — the model was trained
         # with pre-computed silence VAE latents as the default source conditioning)
-        src_latents = (
-            self._silence_latent[:, :num_frames, :]
-            .expand(effective_batch, -1, -1)
-            .clone()
-        )
+        src_latents = self._silence_latent[:, :num_frames, :].expand(effective_batch, -1, -1).clone()
         src_latents = src_latents.to(device=device, dtype=latents.dtype)
         chunk_mask = torch.ones_like(latents)
 
@@ -505,8 +475,8 @@ class AceStepPipeline(DiffusionPipeline):
 
         # 10. Denoising loop
         # On step 0, conditions are encoded inside transformer.forward() (needed for CPU
-        # offload hooks), then cached for all subsequent steps. The unconditional pass uses
-        # the learned null_condition_emb projected through condition_embedder.
+        # offload hooks to place weights on the correct device). The encoded states are
+        # returned cleanly and reused for all subsequent steps.
         encoder_hidden_states = None
         null_encoder_hidden_states = None
         encoder_mask = None
@@ -521,7 +491,7 @@ class AceStepPipeline(DiffusionPipeline):
 
                 # Step 0: encode conditions inside transformer.forward() for CPU offload
                 if encoder_hidden_states is None:
-                    noise_pred_cond = self.transformer(
+                    noise_pred_cond, encoder_hidden_states, encoder_mask = self.transformer(
                         model_input,
                         t_batch,
                         text_hidden_states=text_hidden_states,
@@ -532,20 +502,14 @@ class AceStepPipeline(DiffusionPipeline):
                         timbre_mask=timbre_mask,
                         timestep_r=timestep_r,
                         return_dict=False,
-                    )[0]
-                    encoder_hidden_states = self.transformer._encoded_hidden_states
-                    encoder_mask = self.transformer._encoded_attention_mask
-                    null_encoder_hidden_states = self.transformer.condition_embedder(
-                        self.transformer.null_condition_emb.expand_as(
-                            encoder_hidden_states
-                        )
                     )
-
-                # Prepare guider inputs: (conditional, unconditional) tensors
-                guider_inputs = {
-                    "encoder_hidden_states": (encoder_hidden_states, null_encoder_hidden_states),
-                    "encoder_attention_mask": (encoder_mask, encoder_mask),
-                }
+                    null_encoder_hidden_states = self.transformer.condition_embedder(
+                        self.transformer.null_condition_emb.expand_as(encoder_hidden_states)
+                    )
+                    guider_inputs = {
+                        "encoder_hidden_states": (encoder_hidden_states, null_encoder_hidden_states),
+                        "encoder_attention_mask": (encoder_mask, encoder_mask),
+                    }
 
                 guider.set_state(step=i, num_inference_steps=num_steps, timestep=t)
                 guider_state = guider.prepare_inputs(guider_inputs)
@@ -560,10 +524,7 @@ class AceStepPipeline(DiffusionPipeline):
                         guider.cleanup_models(self.transformer)
                         continue
 
-                    cond_kwargs = {
-                        input_name: getattr(guider_state_batch, input_name)
-                        for input_name in guider_inputs
-                    }
+                    cond_kwargs = {input_name: getattr(guider_state_batch, input_name) for input_name in guider_inputs}
                     with self.transformer.cache_context(context_name):
                         guider_state_batch.noise_pred = self.transformer(
                             model_input,
@@ -577,9 +538,7 @@ class AceStepPipeline(DiffusionPipeline):
                 noise_pred = guider(guider_state)[0]
 
                 # Scheduler step
-                latents = self.scheduler.step(
-                    noise_pred, t, latents, return_dict=False
-                )[0]
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 progress_bar.update()
 

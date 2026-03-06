@@ -63,18 +63,12 @@ class AceStepAttnProcessor:
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = (
-            hidden_states.shape
-            if encoder_hidden_states is None
-            else encoder_hidden_states.shape
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
 
         if attention_mask is not None:
-            attention_mask = attn.prepare_attention_mask(
-                attention_mask, sequence_length, batch_size
-            )
-            attention_mask = attention_mask.view(
-                batch_size, attn.heads, -1, attention_mask.shape[-1]
-            )
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
 
         query = attn.to_q(hidden_states)
 
@@ -240,9 +234,7 @@ class AceStepLyricEncoder(nn.Module):
                     intermediate_size=intermediate_size,
                     rms_norm_eps=rms_norm_eps,
                     sliding_window=(
-                        sliding_window
-                        if (layer_types and layer_types[i] == "sliding_attention")
-                        else None
+                        sliding_window if (layer_types and layer_types[i] == "sliding_attention") else None
                     ),
                 )
                 for i in range(num_layers)
@@ -278,9 +270,7 @@ class AceStepLyricEncoder(nn.Module):
         batch_size = hidden_states.shape[0]
         float_mask = None
         if attention_mask is not None:
-            float_mask = _convert_padding_mask_to_3d_attention_mask(
-                attention_mask, seq_len, hidden_states.dtype
-            )
+            float_mask = _convert_padding_mask_to_3d_attention_mask(attention_mask, seq_len, hidden_states.dtype)
 
         for layer in self.layers:
             # Build sliding window mask if needed
@@ -300,9 +290,7 @@ class AceStepLyricEncoder(nn.Module):
                     layer, hidden_states, rotary_emb, layer_mask, use_reentrant=False
                 )
             else:
-                hidden_states = layer(
-                    hidden_states, rotary_emb=rotary_emb, attention_mask=layer_mask
-                )
+                hidden_states = layer(hidden_states, rotary_emb=rotary_emb, attention_mask=layer_mask)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -367,9 +355,7 @@ class AceStepTimbreEncoder(nn.Module):
                     intermediate_size=intermediate_size,
                     rms_norm_eps=rms_norm_eps,
                     sliding_window=(
-                        sliding_window
-                        if (layer_types and layer_types[i] == "sliding_attention")
-                        else None
+                        sliding_window if (layer_types and layer_types[i] == "sliding_attention") else None
                     ),
                 )
                 for i in range(num_layers)
@@ -407,9 +393,7 @@ class AceStepTimbreEncoder(nn.Module):
         # Convert [B, seq] padding mask to [B, 1, seq] float attention mask
         float_mask = None
         if attention_mask is not None:
-            float_mask = _convert_padding_mask_to_3d_attention_mask(
-                attention_mask, seq_len, hidden_states.dtype
-            )
+            float_mask = _convert_padding_mask_to_3d_attention_mask(attention_mask, seq_len, hidden_states.dtype)
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
@@ -417,9 +401,7 @@ class AceStepTimbreEncoder(nn.Module):
                     layer, hidden_states, rotary_emb, float_mask, use_reentrant=False
                 )
             else:
-                hidden_states = layer(
-                    hidden_states, rotary_emb=rotary_emb, attention_mask=float_mask
-                )
+                hidden_states = layer(hidden_states, rotary_emb=rotary_emb, attention_mask=float_mask)
 
         hidden_states = self.norm(hidden_states)
         # Extract CLS token output
@@ -443,9 +425,7 @@ class AceStepTransformerBlock(nn.Module):
     ):
         super().__init__()
         # Learned AdaLN modulation base: 6 params (shift, scale, gate) x 2 (self-attn + ffn)
-        self.scale_shift_table = nn.Parameter(
-            torch.randn(1, 6, hidden_size) / hidden_size**0.5
-        )
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, hidden_size) / hidden_size**0.5)
 
         # 1. Self-attention
         self.norm1 = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -495,9 +475,9 @@ class AceStepTransformerBlock(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Extract AdaLN modulation parameters
-        shift_msa, scale_msa, gate_msa, shift_ff, scale_ff, gate_ff = (
-            self.scale_shift_table + timestep_proj
-        ).chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_ff, scale_ff, gate_ff = (self.scale_shift_table + timestep_proj).chunk(
+            6, dim=1
+        )
 
         # 1. Self-attention with AdaLN
         norm_hidden_states = self.norm1(hidden_states) * (1 + scale_msa) + shift_msa
@@ -553,8 +533,9 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
     """
 
     _supports_gradient_checkpointing = True
+    _supports_group_offloading = True
     _no_split_modules = ["AceStepTransformerBlock"]
-    _skip_layerwise_casting_patterns = ["patch_embed", "unpatch", "norm"]
+    _skip_layerwise_casting_patterns = ["patch_embed", "unpatch", "norm", "time_embed", "lyric_encoder", "timbre_encoder", "condition_embedder"]
 
     @register_to_config
     def __init__(
@@ -580,18 +561,11 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
         super().__init__()
 
         # Build layer_types pattern (odd layers = sliding, even layers = full)
-        layer_types = [
-            "sliding_attention" if bool((i + 1) % 2) else "full_attention"
-            for i in range(num_layers)
-        ]
+        layer_types = ["sliding_attention" if bool((i + 1) % 2) else "full_attention" for i in range(num_layers)]
 
         # Patch embed / unpatch
-        self.patch_embed = nn.Conv1d(
-            in_channels, hidden_size, kernel_size=patch_size, stride=patch_size
-        )
-        self.unpatch = nn.ConvTranspose1d(
-            hidden_size, out_channels, kernel_size=patch_size, stride=patch_size
-        )
+        self.patch_embed = nn.Conv1d(in_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
+        self.unpatch = nn.ConvTranspose1d(hidden_size, out_channels, kernel_size=patch_size, stride=patch_size)
 
         # Timestep embeddings (t and t-r)
         # Original uses scale=1000, sin-then-cos order, divide by half (not half-1)
@@ -652,11 +626,7 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
                     head_dim=head_dim,
                     intermediate_size=intermediate_size,
                     rms_norm_eps=rms_norm_eps,
-                    sliding_window=(
-                        sliding_window
-                        if layer_types[i] == "sliding_attention"
-                        else None
-                    ),
+                    sliding_window=(sliding_window if layer_types[i] == "sliding_attention" else None),
                 )
                 for i in range(num_layers)
             ]
@@ -664,9 +634,7 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
 
         # Output
         self.norm_out = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.output_scale_shift_table = nn.Parameter(
-            torch.randn(1, 2, hidden_size) / hidden_size**0.5
-        )
+        self.output_scale_shift_table = nn.Parameter(torch.randn(1, 2, hidden_size) / hidden_size**0.5)
 
         # Null condition embedding for CFG
         self.null_condition_emb = nn.Parameter(torch.randn(1, 1, hidden_size))
@@ -676,9 +644,7 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
         # Silence latent: pre-computed VAE encoding of silence, used as the default
         # source conditioning for text2music generation and as timbre encoder input.
         # Shape: [1, max_frames, out_channels] — stored transposed from the original [1, C, T].
-        self.register_buffer(
-            "silence_latent", torch.zeros(1, 15000, out_channels), persistent=True
-        )
+        self.register_buffer("silence_latent", torch.zeros(1, 15000, out_channels), persistent=True)
 
     @staticmethod
     def _pack_sequences(
@@ -693,14 +659,12 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
         batch_size, seq_len, dim = hidden_cat.shape
 
         sort_idx = mask_cat.argsort(dim=1, descending=True, stable=True)
-        hidden_packed = torch.gather(
-            hidden_cat, 1, sort_idx.unsqueeze(-1).expand(batch_size, seq_len, dim)
-        )
+        hidden_packed = torch.gather(hidden_cat, 1, sort_idx.unsqueeze(-1).expand(batch_size, seq_len, dim))
 
         lengths = mask_cat.sum(dim=1)
-        new_mask = torch.arange(
-            seq_len, dtype=torch.long, device=hidden_cat.device
-        ).unsqueeze(0) < lengths.unsqueeze(1)
+        new_mask = torch.arange(seq_len, dtype=torch.long, device=hidden_cat.device).unsqueeze(0) < lengths.unsqueeze(
+            1
+        )
         return hidden_packed, new_mask
 
     def encode_conditions(
@@ -730,16 +694,12 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
         text_hidden_states = self.text_projector(text_hidden_states)
 
         # Encode lyrics: 1024 → 2048 via 8-layer encoder
-        lyric_hidden_states = self.lyric_encoder(
-            lyric_embeds, attention_mask=lyric_mask
-        )
+        lyric_hidden_states = self.lyric_encoder(lyric_embeds, attention_mask=lyric_mask)
 
         # Pack lyrics + text
         if timbre_hidden_states is not None:
             # Encode timbre → [B, 1, 2048]
-            timbre_output = self.timbre_encoder(
-                timbre_hidden_states, attention_mask=timbre_mask
-            )
+            timbre_output = self.timbre_encoder(timbre_hidden_states, attention_mask=timbre_mask)
             timbre_out_mask = torch.ones(
                 timbre_output.shape[0],
                 timbre_output.shape[1],
@@ -777,7 +737,7 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Create a bidirectional sliding window attention mask as [B, seq, seq] for StableAudioAttnProcessor2_0."""
+        """Create a bidirectional sliding window attention mask as [B, seq, seq] for AceStepAttnProcessor."""
         indices = torch.arange(seq_len, device=device)
         diff = indices.unsqueeze(1) - indices.unsqueeze(0)
         valid = torch.abs(diff) <= window_size
@@ -826,10 +786,12 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
             return_dict: Whether to return a dict or tuple.
 
         Returns:
-            Transformer2DModelOutput with predicted noise/velocity [B, T, 64].
+            `Transformer2DModelOutput` or `tuple`. When raw condition inputs are provided and
+            `return_dict=False`, returns `(sample, encoder_hidden_states, encoder_attention_mask)`.
         """
         # Encode conditions from raw inputs if pre-encoded states not provided
-        if encoder_hidden_states is None:
+        encoded_from_raw = encoder_hidden_states is None
+        if encoded_from_raw:
             encoder_hidden_states, encoder_attention_mask = self.encode_conditions(
                 text_hidden_states=text_hidden_states,
                 text_mask=text_mask,
@@ -838,9 +800,6 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
                 timbre_hidden_states=timbre_hidden_states,
                 timbre_mask=timbre_mask,
             )
-            # Store for pipeline caching (avoids re-encoding on subsequent steps)
-            self._encoded_hidden_states = encoder_hidden_states
-            self._encoded_attention_mask = encoder_attention_mask
 
         if timestep_r is None:
             timestep_r = timestep
@@ -853,9 +812,7 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
         pad_length = 0
         if hidden_states.shape[1] % patch_size != 0:
             pad_length = patch_size - (hidden_states.shape[1] % patch_size)
-            hidden_states = F.pad(
-                hidden_states, (0, 0, 0, pad_length), mode="constant", value=0
-            )
+            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_length), mode="constant", value=0)
 
         # Patch embed: [B, T, C] → transpose → Conv1d → transpose → [B, T//patch, hidden]
         hidden_states = hidden_states.transpose(1, 2)
@@ -930,9 +887,7 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
                 )
 
         # Output AdaLN
-        shift, scale = (self.output_scale_shift_table + temb.unsqueeze(1)).chunk(
-            2, dim=1
-        )
+        shift, scale = (self.output_scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
         hidden_states = self.norm_out(hidden_states) * (1 + scale) + shift
 
         # Unpatch: [B, T//patch, hidden] → transpose → ConvTranspose1d → transpose → [B, T, out_channels]
@@ -944,6 +899,8 @@ class AceStepTransformer1DModel(ModelMixin, CacheMixin, AttentionMixin, ConfigMi
         hidden_states = hidden_states[:, :original_seq_len, :]
 
         if not return_dict:
+            if encoded_from_raw:
+                return (hidden_states, encoder_hidden_states, encoder_attention_mask)
             return (hidden_states,)
 
         return Transformer2DModelOutput(sample=hidden_states)
