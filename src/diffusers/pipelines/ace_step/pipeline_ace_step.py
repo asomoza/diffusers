@@ -29,6 +29,40 @@ from ..pipeline_utils import AudioPipelineOutput, DiffusionPipeline
 
 logger = logging.get_logger(__name__)
 
+
+def _apg_forward(
+    pred_cond: torch.Tensor,
+    pred_uncond: torch.Tensor,
+    guidance_scale: float,
+    momentum_buffer: list,
+    momentum: float = -0.75,
+    norm_threshold: float = 2.5,
+):
+    """Adaptive Projected Guidance (APG) — matches the original ACE-Step SFT guidance."""
+    diff = pred_cond - pred_uncond
+
+    # Momentum update
+    if momentum_buffer:
+        new_avg = momentum * momentum_buffer[0]
+        momentum_buffer[0] = diff + new_avg
+    else:
+        momentum_buffer.append(diff.clone())
+    diff = momentum_buffer[0]
+
+    # Norm thresholding
+    if norm_threshold > 0:
+        diff_norm = diff.norm(p=2, dim=[1], keepdim=True)
+        scale_factor = torch.minimum(torch.ones_like(diff_norm), norm_threshold / diff_norm)
+        diff = diff * scale_factor
+
+    # Project orthogonal to conditional prediction
+    v0 = diff.double()
+    v1 = torch.nn.functional.normalize(pred_cond.double(), dim=[1])
+    v0_parallel = (v0 * v1).sum(dim=[1], keepdim=True) * v1
+    diff_orthogonal = (v0 - v0_parallel).to(diff.dtype)
+
+    return pred_cond + (guidance_scale - 1) * diff_orthogonal
+
 EXAMPLE_DOC_STRING = """
     Examples:
         ```py
@@ -524,34 +558,13 @@ class AceStepPipeline(DiffusionPipeline):
         timbre_hidden_states, timbre_mask = self.encode_audio(effective_batch, device)
 
         # 5. Prepare raw condition inputs (will be encoded inside transformer.forward)
-        if self.do_classifier_free_guidance:
-            # Pad positive and negative text to same seq length, concat on batch dim
-            prompt_embeds, prompt_mask, negative_embeds, negative_mask = (
-                self._pad_and_batch_cfg(
-                    prompt_embeds, prompt_mask, negative_embeds, negative_mask
-                )
-            )
-            text_hidden_states = torch.cat([negative_embeds, prompt_embeds], dim=0)
-            text_mask = torch.cat([negative_mask, prompt_mask], dim=0)
-
-            # Pad positive and negative lyrics to same seq length, concat on batch dim
-            lyric_embeds, lyric_mask, neg_lyric_embeds, neg_lyric_mask = (
-                self._pad_and_batch_cfg(
-                    lyric_embeds, lyric_mask, neg_lyric_embeds, neg_lyric_mask
-                )
-            )
-            lyric_hidden_states = torch.cat([neg_lyric_embeds, lyric_embeds], dim=0)
-            lyric_attention_mask = torch.cat([neg_lyric_mask, lyric_mask], dim=0)
-
-            # Timbre is the same for both, just double
-            timbre_hidden_states = timbre_hidden_states.repeat(2, 1, 1)
-            if timbre_mask is not None:
-                timbre_mask = timbre_mask.repeat(2, 1)
-        else:
-            text_hidden_states = prompt_embeds
-            text_mask = prompt_mask
-            lyric_hidden_states = lyric_embeds
-            lyric_attention_mask = lyric_mask
+        # CFG uses the transformer's learned null_condition_emb in the encoded hidden state
+        # space, so we only encode the positive conditions here. The unconditional pass uses
+        # null_condition_emb directly, matching how the model was trained.
+        text_hidden_states = prompt_embeds
+        text_mask = prompt_mask
+        lyric_hidden_states = lyric_embeds
+        lyric_attention_mask = lyric_mask
 
         # Cast condition tensors to transformer dtype (text encoder may output float32)
         dtype = self.transformer.dtype
@@ -588,43 +601,41 @@ class AceStepPipeline(DiffusionPipeline):
         chunk_mask = torch.ones_like(latents)
 
         # 9. Build timestep schedule via the scheduler
+        # ACE-Step uses linspace(1, 0, steps+1) with shift applied, matching the original
+        # implementation. We compute sigmas explicitly to avoid the scheduler's default
+        # sigma_min/sigma_max which produces a slightly different schedule.
         if turbo_sigmas is not None:
-            # turbo_sigmas are already the final (post-shift) sigma values — bypass scheduler shift
-            self.scheduler.set_shift(1.0)
-            self.scheduler.set_timesteps(sigmas=turbo_sigmas, device=device)
+            sigmas = turbo_sigmas
         else:
-            self.scheduler.set_shift(shift)
-            self.scheduler.set_timesteps(
-                num_inference_steps=num_inference_steps, device=device
-            )
+            sigmas = torch.linspace(1.0, 0.0, num_inference_steps + 1).tolist()[:-1]
+            if shift != 1.0:
+                sigmas = [shift * s / (1 + (shift - 1) * s) for s in sigmas]
+        self.scheduler.set_shift(1.0)
+        self.scheduler.set_timesteps(sigmas=sigmas, device=device)
 
         timesteps = self.scheduler.timesteps
         num_steps = len(timesteps)
         self._num_timesteps = num_steps
 
         # 10. Denoising loop
+        # Conditions are encoded via the first forward() call (triggers CPU offload hooks),
+        # then cached for all subsequent steps. For CFG, the unconditional pass uses the
+        # learned null_condition_emb — matching how the model was trained.
         encoder_hidden_states = None
         encoder_mask = None
+        null_encoder_hidden_states = None
+        apg_momentum_buffer = []
 
         with self.progress_bar(total=num_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # Current sigma for the model (0-1 range)
                 sigma = self.scheduler.sigmas[i]
 
-                # Concatenate context + latent → [B, T, 192] (src, mask, latent order matches original)
                 model_input = torch.cat([src_latents, chunk_mask, latents], dim=-1)
-
-                if self.do_classifier_free_guidance:
-                    model_input = torch.cat([model_input] * 2)
-
-                # timestep_r = t for turbo (so t - t_r = 0), random*t for base
                 t_batch = sigma.expand(model_input.shape[0])
-                timestep_r = (
-                    t_batch  # turbo: t_r = t, meaning time_embed_r gets embedding of 0
-                )
+                timestep_r = t_batch
 
                 if encoder_hidden_states is not None:
-                    # Use cached encoded conditions (avoids re-encoding every step)
+                    # Use cached encoded conditions
                     noise_pred = self.transformer(
                         model_input,
                         t_batch,
@@ -634,7 +645,7 @@ class AceStepPipeline(DiffusionPipeline):
                         return_dict=False,
                     )[0]
                 else:
-                    # First step: pass raw conditions, let forward() encode them
+                    # First step: encode conditions via forward() (needed for CPU offload)
                     noise_pred = self.transformer(
                         model_input,
                         t_batch,
@@ -647,14 +658,33 @@ class AceStepPipeline(DiffusionPipeline):
                         timestep_r=timestep_r,
                         return_dict=False,
                     )[0]
-                    # Cache the encoded conditions from the transformer for subsequent steps
                     encoder_hidden_states = self.transformer._encoded_hidden_states
                     encoder_mask = self.transformer._encoded_attention_mask
+                    if self.do_classifier_free_guidance:
+                        # Project null condition through condition_embedder to match
+                        # the original, which applies condition_embedder to all encoder
+                        # hidden states (both cond and null_cond) inside the decoder.
+                        null_encoder_hidden_states = self.transformer.condition_embedder(
+                            self.transformer.null_condition_emb.expand_as(
+                                encoder_hidden_states
+                            )
+                        )
 
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond
+                    # Separate unconditional pass (avoids 2x VRAM from batch doubling)
+                    noise_pred_uncond = self.transformer(
+                        model_input,
+                        t_batch,
+                        encoder_hidden_states=null_encoder_hidden_states,
+                        encoder_attention_mask=encoder_mask,
+                        timestep_r=timestep_r,
+                        return_dict=False,
+                    )[0]
+                    noise_pred = _apg_forward(
+                        noise_pred,
+                        noise_pred_uncond,
+                        guidance_scale,
+                        apg_momentum_buffer,
                     )
 
                 # Scheduler step (handles Euler ODE step including final step with sigma_next=0)
@@ -671,8 +701,7 @@ class AceStepPipeline(DiffusionPipeline):
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
                     latents = callback_outputs.pop("latents", latents)
 
-        # 11. VAE decode
-        # Note: For long audio (e.g. 90s+), VAE decode can use significant VRAM.
+        # 12. VAE decode
         if output_type != "latent":
             # VAE expects [B, channels, time]
             audio = self.vae.decode(latents.transpose(1, 2)).sample
