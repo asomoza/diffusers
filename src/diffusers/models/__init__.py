@@ -86,6 +86,7 @@ if is_torch_available():
     _import_structure["transformers.prior_transformer"] = ["PriorTransformer"]
     _import_structure["transformers.sana_transformer"] = ["SanaTransformer2DModel"]
     _import_structure["transformers.stable_audio_transformer"] = ["StableAudioDiTModel"]
+    _import_structure["transformers.transformer_ace_step"] = ["AceStepTransformer1DModel"]
     _import_structure["transformers.t5_film_transformer"] = ["T5FilmDecoder"]
     _import_structure["transformers.transformer_2d"] = ["Transformer2DModel"]
     _import_structure["transformers.transformer_allegro"] = ["AllegroTransformer3DModel"]
@@ -196,6 +197,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from .embeddings import ImageProjection
         from .modeling_utils import ModelMixin
         from .transformers import (
+            AceStepTransformer1DModel,
             AllegroTransformer3DModel,
             AuraFlowTransformer2DModel,
             BriaFiboTransformer2DModel,
