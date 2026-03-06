@@ -18,7 +18,12 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, BertConfig, BertModel
 
-from diffusers import AceStepPipeline, AutoencoderOobleck, FlowMatchEulerDiscreteScheduler
+from diffusers import (
+    AceStepPipeline,
+    AutoencoderOobleck,
+    ClassifierFreeGuidance,
+    FlowMatchEulerDiscreteScheduler,
+)
 from diffusers.models.transformers.transformer_ace_step import AceStepTransformer1DModel
 
 from ...testing_utils import enable_full_determinism, torch_device
@@ -36,7 +41,6 @@ class AceStepPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             "prompt",
             "audio_duration_in_s",
             "guidance_scale",
-            "negative_prompt",
             "lyrics",
         ]
     )
@@ -107,6 +111,7 @@ class AceStepPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             "vae": vae,
             "text_encoder": text_encoder,
             "tokenizer": tokenizer,
+            "guider": None,
         }
         return components
 
@@ -160,7 +165,21 @@ class AceStepPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         max_diff = np.abs(expected_slice - audio_slice).max()
         assert max_diff < 1e-2, f"Audio slice mismatch: {max_diff:.6f}"
 
-    def test_ace_step_negative_prompt(self):
+    def test_ace_step_with_guider(self):
+        device = "cpu"
+        components = self.get_dummy_components()
+        components["guider"] = ClassifierFreeGuidance(guidance_scale=3.0)
+        pipe = AceStepPipeline(**components)
+        pipe = pipe.to(device)
+        pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        output = pipe(**inputs)
+        audio = output.audios[0]
+
+        assert audio.ndim == 2
+
+    def test_ace_step_guidance_scale_fallback(self):
         device = "cpu"
         components = self.get_dummy_components()
         pipe = AceStepPipeline(**components)
@@ -168,7 +187,6 @@ class AceStepPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         pipe.set_progress_bar_config(disable=None)
 
         inputs = self.get_dummy_inputs(device)
-        inputs["negative_prompt"] = "bad quality"
         inputs["guidance_scale"] = 3.0
         output = pipe(**inputs)
         audio = output.audios[0]

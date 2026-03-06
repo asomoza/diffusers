@@ -20,6 +20,8 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
+from ...guiders import ClassifierFreeGuidance
+from ...guiders.guider_utils import BaseGuidance
 from ...models import AutoencoderOobleck
 from ...models.transformers.transformer_ace_step import AceStepTransformer1DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
@@ -29,40 +31,6 @@ from ..pipeline_utils import AudioPipelineOutput, DiffusionPipeline
 
 
 logger = logging.get_logger(__name__)
-
-
-def _apg_forward(
-    pred_cond: torch.Tensor,
-    pred_uncond: torch.Tensor,
-    guidance_scale: float,
-    momentum_buffer: list,
-    momentum: float = -0.75,
-    norm_threshold: float = 2.5,
-):
-    """Adaptive Projected Guidance (APG) — matches the original ACE-Step SFT guidance."""
-    diff = pred_cond - pred_uncond
-
-    # Momentum update
-    if momentum_buffer:
-        new_avg = momentum * momentum_buffer[0]
-        momentum_buffer[0] = diff + new_avg
-    else:
-        momentum_buffer.append(diff.clone())
-    diff = momentum_buffer[0]
-
-    # Norm thresholding
-    if norm_threshold > 0:
-        diff_norm = diff.norm(p=2, dim=[1], keepdim=True)
-        scale_factor = torch.minimum(torch.ones_like(diff_norm), norm_threshold / diff_norm)
-        diff = diff * scale_factor
-
-    # Project orthogonal to conditional prediction
-    v0 = diff.double()
-    v1 = torch.nn.functional.normalize(pred_cond.double(), dim=[1])
-    v0_parallel = (v0 * v1).sum(dim=[1], keepdim=True) * v1
-    diff_orthogonal = (v0 - v0_parallel).to(diff.dtype)
-
-    return pred_cond + (guidance_scale - 1) * diff_orthogonal
 
 EXAMPLE_DOC_STRING = """
     Examples:
@@ -104,10 +72,16 @@ class AceStepPipeline(DiffusionPipeline):
             ACE-Step DiT model to denoise the encoded audio latents.
         scheduler ([`FlowMatchEulerDiscreteScheduler`]):
             A scheduler for flow matching denoising.
+        guider ([`~guiders.guider_utils.BaseGuidance`], *optional*):
+            A guidance technique to apply during denoising. For example,
+            [`AdaptiveProjectedGuidance`] or [`ClassifierFreeGuidance`]. If not provided, guidance
+            can be enabled via the `guidance_scale` parameter in `__call__` (which creates a
+            [`ClassifierFreeGuidance`] guider as fallback).
     """
 
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     _callback_tensor_inputs = ["latents"]
+    _optional_components = ["guider"]
 
     # Template used during ACE-Step training for the text encoder input.
     _PROMPT_TEMPLATE = "# Instruction\n{instruction}\n\n# Caption\n{caption}\n\n# Metas\n{metas}<|endoftext|>\n"
@@ -121,6 +95,7 @@ class AceStepPipeline(DiffusionPipeline):
         tokenizer: PreTrainedTokenizerBase,
         transformer: AceStepTransformer1DModel,
         scheduler: FlowMatchEulerDiscreteScheduler,
+        guider: BaseGuidance | None = None,
     ):
         super().__init__()
 
@@ -130,6 +105,7 @@ class AceStepPipeline(DiffusionPipeline):
             tokenizer=tokenizer,
             transformer=transformer,
             scheduler=scheduler,
+            guider=guider,
         )
 
         # Cache silence_latent as a plain tensor so it remains accessible even when
@@ -147,10 +123,6 @@ class AceStepPipeline(DiffusionPipeline):
     @property
     def num_timesteps(self):
         return self._num_timesteps
-
-    @property
-    def do_classifier_free_guidance(self):
-        return self._guidance_scale > 1.0
 
     def enable_vae_tiling(self, chunk_size: int = 256, overlap: int = 64):
         r"""
@@ -238,7 +210,6 @@ class AceStepPipeline(DiffusionPipeline):
         prompt,
         audio_duration_in_s,
         num_inference_steps,
-        guidance_scale,
         callback_on_step_end_tensor_inputs=None,
     ):
         if prompt is None:
@@ -258,11 +229,6 @@ class AceStepPipeline(DiffusionPipeline):
                 f"`num_inference_steps` must be positive, but got {num_inference_steps}."
             )
 
-        if guidance_scale is not None and guidance_scale < 1.0:
-            raise ValueError(
-                f"`guidance_scale` must be >= 1.0, but got {guidance_scale}."
-            )
-
         if callback_on_step_end_tensor_inputs is not None and not all(
             k in self._callback_tensor_inputs
             for k in callback_on_step_end_tensor_inputs
@@ -271,25 +237,6 @@ class AceStepPipeline(DiffusionPipeline):
                 f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found "
                 f"{[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
             )
-
-    @staticmethod
-    def _pad_and_batch_cfg(
-        pos_tensor: torch.Tensor,
-        pos_mask: torch.Tensor,
-        neg_tensor: torch.Tensor,
-        neg_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pad positive and negative tensors to the same sequence length for CFG batching."""
-        max_len = max(pos_tensor.shape[1], neg_tensor.shape[1])
-        if pos_tensor.shape[1] < max_len:
-            pad = max_len - pos_tensor.shape[1]
-            pos_tensor = F.pad(pos_tensor, (0, 0, 0, pad))
-            pos_mask = F.pad(pos_mask, (0, pad), value=0)
-        if neg_tensor.shape[1] < max_len:
-            pad = max_len - neg_tensor.shape[1]
-            neg_tensor = F.pad(neg_tensor, (0, 0, 0, pad))
-            neg_mask = F.pad(neg_mask, (0, pad), value=0)
-        return pos_tensor, pos_mask, neg_tensor, neg_mask
 
     @staticmethod
     def _format_prompt(
@@ -334,13 +281,10 @@ class AceStepPipeline(DiffusionPipeline):
         prompt: str | list[str],
         device: torch.device,
         num_waveforms_per_prompt: int = 1,
-        do_classifier_free_guidance: bool = True,
-        negative_prompt: str | list[str] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode text prompt using the text encoder."""
         if isinstance(prompt, str):
             prompt = [prompt]
-        batch_size = len(prompt)
 
         text_inputs = self.tokenizer(
             prompt,
@@ -366,39 +310,7 @@ class AceStepPipeline(DiffusionPipeline):
                 num_waveforms_per_prompt, dim=0
             )
 
-        negative_embeds = None
-        negative_mask = None
-        if do_classifier_free_guidance:
-            if negative_prompt is not None:
-                if isinstance(negative_prompt, str):
-                    negative_prompt = [negative_prompt] * batch_size
-                neg_inputs = self.tokenizer(
-                    negative_prompt,
-                    max_length=256,
-                    padding="longest",
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                neg_ids = neg_inputs.input_ids.to(device)
-                neg_mask = neg_inputs.attention_mask.to(device)
-                neg_output = self.text_encoder(
-                    input_ids=neg_ids, attention_mask=neg_mask
-                )
-                negative_embeds = neg_output.last_hidden_state
-                negative_mask = neg_mask
-            else:
-                negative_embeds = torch.zeros_like(prompt_embeds)
-                negative_mask = torch.zeros_like(attention_mask)
-
-            if num_waveforms_per_prompt > 1:
-                negative_embeds = negative_embeds.repeat_interleave(
-                    num_waveforms_per_prompt, dim=0
-                )
-                negative_mask = negative_mask.repeat_interleave(
-                    num_waveforms_per_prompt, dim=0
-                )
-
-        return prompt_embeds, attention_mask, negative_embeds, negative_mask
+        return prompt_embeds, attention_mask
 
     def encode_lyrics(
         self,
@@ -406,16 +318,13 @@ class AceStepPipeline(DiffusionPipeline):
         device: torch.device,
         batch_size: int,
         num_waveforms_per_prompt: int = 1,
-        do_classifier_free_guidance: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode lyrics by looking up token embeddings (no text encoder forward pass)."""
         if lyrics is None:
             # Return empty embeddings
             embed_dim = self.text_encoder.config.hidden_size
             lyric_embeds = torch.zeros(batch_size, 1, embed_dim, device=device)
             lyric_mask = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
-            neg_lyric_embeds = lyric_embeds if do_classifier_free_guidance else None
-            neg_lyric_mask = lyric_mask if do_classifier_free_guidance else None
             if num_waveforms_per_prompt > 1:
                 lyric_embeds = lyric_embeds.repeat_interleave(
                     num_waveforms_per_prompt, dim=0
@@ -423,14 +332,7 @@ class AceStepPipeline(DiffusionPipeline):
                 lyric_mask = lyric_mask.repeat_interleave(
                     num_waveforms_per_prompt, dim=0
                 )
-                if neg_lyric_embeds is not None:
-                    neg_lyric_embeds = neg_lyric_embeds.repeat_interleave(
-                        num_waveforms_per_prompt, dim=0
-                    )
-                    neg_lyric_mask = neg_lyric_mask.repeat_interleave(
-                        num_waveforms_per_prompt, dim=0
-                    )
-            return lyric_embeds, lyric_mask, neg_lyric_embeds, neg_lyric_mask
+            return lyric_embeds, lyric_mask
 
         if isinstance(lyrics, str):
             lyrics = [lyrics] * batch_size
@@ -455,13 +357,7 @@ class AceStepPipeline(DiffusionPipeline):
             )
             lyric_mask = lyric_mask.repeat_interleave(num_waveforms_per_prompt, dim=0)
 
-        neg_lyric_embeds = None
-        neg_lyric_mask = None
-        if do_classifier_free_guidance:
-            neg_lyric_embeds = torch.zeros_like(lyric_embeds)
-            neg_lyric_mask = torch.zeros_like(lyric_mask)
-
-        return lyric_embeds, lyric_mask, neg_lyric_embeds, neg_lyric_mask
+        return lyric_embeds, lyric_mask
 
     def encode_audio(
         self,
@@ -498,7 +394,6 @@ class AceStepPipeline(DiffusionPipeline):
         audio_duration_in_s: float = 30.0,
         num_inference_steps: int = 50,
         guidance_scale: float = 1.0,
-        negative_prompt: str | list[str] | None = None,
         num_waveforms_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
@@ -529,11 +424,10 @@ class AceStepPipeline(DiffusionPipeline):
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps.
             guidance_scale (`float`, *optional*, defaults to 1.0):
-                Classifier-free guidance scale. The original ACE-Step model does not use CFG during
-                inference (guidance_scale=1.0). Values > 1.0 enable classifier-free guidance with
-                unconditional (zero) embeddings as the negative condition.
-            negative_prompt (`str` or `list[str]`, *optional*):
-                The prompt or prompts for negative guidance.
+                Classifier-free guidance scale. Only used when no `guider` component is registered on the
+                pipeline. When `guidance_scale > 1.0`, a [`ClassifierFreeGuidance`] guider is created
+                automatically as a fallback. For more control (e.g. APG with momentum), register a guider
+                component instead.
             num_waveforms_per_prompt (`int`, *optional*, defaults to 1):
                 The number of waveforms to generate per prompt.
             generator (`torch.Generator`, *optional*):
@@ -577,7 +471,6 @@ class AceStepPipeline(DiffusionPipeline):
             prompt,
             audio_duration_in_s,
             num_inference_steps,
-            guidance_scale,
             callback_on_step_end_tensor_inputs,
         )
 
@@ -590,7 +483,15 @@ class AceStepPipeline(DiffusionPipeline):
         device = self._execution_device
         self._guidance_scale = guidance_scale
 
-        # 2. Format and encode text prompt using the training template
+        # 2. Select guider: prefer registered component, fall back to guidance_scale param
+        if self.guider is not None:
+            guider = self.guider
+        elif guidance_scale > 1.0:
+            guider = ClassifierFreeGuidance(guidance_scale=guidance_scale)
+        else:
+            guider = ClassifierFreeGuidance(enabled=False)
+
+        # 3. Format and encode text prompt using the training template
         if isinstance(prompt, str):
             formatted_prompts = [
                 self._format_prompt(
@@ -613,15 +514,13 @@ class AceStepPipeline(DiffusionPipeline):
                 for p in prompt
             ]
 
-        prompt_embeds, prompt_mask, negative_embeds, negative_mask = self.encode_prompt(
+        prompt_embeds, prompt_mask = self.encode_prompt(
             formatted_prompts,
             device,
             num_waveforms_per_prompt,
-            self.do_classifier_free_guidance,
-            negative_prompt,
         )
 
-        # 3. Format and encode lyrics using the training template
+        # 4. Format and encode lyrics using the training template
         formatted_lyrics = None
         if lyrics is not None:
             if isinstance(lyrics, str):
@@ -631,31 +530,21 @@ class AceStepPipeline(DiffusionPipeline):
                     self._format_lyrics(l, lyric_language) for l in lyrics
                 ]
 
-        lyric_embeds, lyric_mask, neg_lyric_embeds, neg_lyric_mask = self.encode_lyrics(
+        lyric_embeds, lyric_mask = self.encode_lyrics(
             formatted_lyrics,
             device,
             batch_size,
             num_waveforms_per_prompt,
-            self.do_classifier_free_guidance,
         )
 
-        # 4. Prepare timbre conditioning from silence latent (used for text2music)
+        # 5. Prepare timbre conditioning from silence latent (used for text2music)
         effective_batch = batch_size * num_waveforms_per_prompt
         timbre_hidden_states, timbre_mask = self.encode_audio(effective_batch, device)
 
-        # 5. Prepare raw condition inputs (will be encoded inside transformer.forward)
-        # CFG uses the transformer's learned null_condition_emb in the encoded hidden state
-        # space, so we only encode the positive conditions here. The unconditional pass uses
-        # null_condition_emb directly, matching how the model was trained.
-        text_hidden_states = prompt_embeds
-        text_mask = prompt_mask
-        lyric_hidden_states = lyric_embeds
-        lyric_attention_mask = lyric_mask
-
         # Cast condition tensors to transformer dtype (text encoder may output float32)
         dtype = self.transformer.dtype
-        text_hidden_states = text_hidden_states.to(dtype=dtype)
-        lyric_hidden_states = lyric_hidden_states.to(dtype=dtype)
+        text_hidden_states = prompt_embeds.to(dtype=dtype)
+        lyric_hidden_states = lyric_embeds.to(dtype=dtype)
         timbre_hidden_states = timbre_hidden_states.to(dtype=dtype)
 
         # 6. Compute latent dimensions
@@ -687,9 +576,6 @@ class AceStepPipeline(DiffusionPipeline):
         chunk_mask = torch.ones_like(latents)
 
         # 9. Build timestep schedule via the scheduler
-        # ACE-Step uses linspace(1, 0, steps+1) with shift applied, matching the original
-        # implementation. We compute sigmas explicitly to avoid the scheduler's default
-        # sigma_min/sigma_max which produces a slightly different schedule.
         if turbo_sigmas is not None:
             sigmas = turbo_sigmas
         else:
@@ -704,13 +590,12 @@ class AceStepPipeline(DiffusionPipeline):
         self._num_timesteps = num_steps
 
         # 10. Denoising loop
-        # Conditions are encoded via the first forward() call (triggers CPU offload hooks),
-        # then cached for all subsequent steps. For CFG, the unconditional pass uses the
-        # learned null_condition_emb — matching how the model was trained.
+        # On step 0, conditions are encoded inside transformer.forward() (needed for CPU
+        # offload hooks), then cached for all subsequent steps. The unconditional pass uses
+        # the learned null_condition_emb projected through condition_embedder.
         encoder_hidden_states = None
-        encoder_mask = None
         null_encoder_hidden_states = None
-        apg_momentum_buffer = []
+        encoder_mask = None
 
         with self.progress_bar(total=num_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -720,25 +605,15 @@ class AceStepPipeline(DiffusionPipeline):
                 t_batch = sigma.expand(model_input.shape[0])
                 timestep_r = t_batch
 
-                if encoder_hidden_states is not None:
-                    # Use cached encoded conditions
-                    noise_pred = self.transformer(
-                        model_input,
-                        t_batch,
-                        encoder_hidden_states=encoder_hidden_states,
-                        encoder_attention_mask=encoder_mask,
-                        timestep_r=timestep_r,
-                        return_dict=False,
-                    )[0]
-                else:
-                    # First step: encode conditions via forward() (needed for CPU offload)
-                    noise_pred = self.transformer(
+                # Step 0: encode conditions inside transformer.forward() for CPU offload
+                if encoder_hidden_states is None:
+                    noise_pred_cond = self.transformer(
                         model_input,
                         t_batch,
                         text_hidden_states=text_hidden_states,
-                        text_mask=text_mask,
+                        text_mask=prompt_mask,
                         lyric_embeds=lyric_hidden_states,
-                        lyric_mask=lyric_attention_mask,
+                        lyric_mask=lyric_mask,
                         timbre_hidden_states=timbre_hidden_states,
                         timbre_mask=timbre_mask,
                         timestep_r=timestep_r,
@@ -746,34 +621,48 @@ class AceStepPipeline(DiffusionPipeline):
                     )[0]
                     encoder_hidden_states = self.transformer._encoded_hidden_states
                     encoder_mask = self.transformer._encoded_attention_mask
-                    if self.do_classifier_free_guidance:
-                        # Project null condition through condition_embedder to match
-                        # the original, which applies condition_embedder to all encoder
-                        # hidden states (both cond and null_cond) inside the decoder.
-                        null_encoder_hidden_states = self.transformer.condition_embedder(
-                            self.transformer.null_condition_emb.expand_as(
-                                encoder_hidden_states
-                            )
+                    null_encoder_hidden_states = self.transformer.condition_embedder(
+                        self.transformer.null_condition_emb.expand_as(
+                            encoder_hidden_states
                         )
-
-                if self.do_classifier_free_guidance:
-                    # Separate unconditional pass (avoids 2x VRAM from batch doubling)
-                    noise_pred_uncond = self.transformer(
-                        model_input,
-                        t_batch,
-                        encoder_hidden_states=null_encoder_hidden_states,
-                        encoder_attention_mask=encoder_mask,
-                        timestep_r=timestep_r,
-                        return_dict=False,
-                    )[0]
-                    noise_pred = _apg_forward(
-                        noise_pred,
-                        noise_pred_uncond,
-                        guidance_scale,
-                        apg_momentum_buffer,
                     )
 
-                # Scheduler step (handles Euler ODE step including final step with sigma_next=0)
+                # Prepare guider inputs: (conditional, unconditional) tensors
+                guider_inputs = {
+                    "encoder_hidden_states": (encoder_hidden_states, null_encoder_hidden_states),
+                    "encoder_attention_mask": (encoder_mask, encoder_mask),
+                }
+
+                guider.set_state(step=i, num_inference_steps=num_steps, timestep=t)
+                guider_state = guider.prepare_inputs(guider_inputs)
+
+                for guider_state_batch in guider_state:
+                    guider.prepare_models(self.transformer)
+                    context_name = getattr(guider_state_batch, guider._identifier_key)
+
+                    # On step 0, reuse the conditional prediction from the encoding pass
+                    if i == 0 and context_name == "pred_cond":
+                        guider_state_batch.noise_pred = noise_pred_cond
+                        guider.cleanup_models(self.transformer)
+                        continue
+
+                    cond_kwargs = {
+                        input_name: getattr(guider_state_batch, input_name)
+                        for input_name in guider_inputs
+                    }
+                    with self.transformer.cache_context(context_name):
+                        guider_state_batch.noise_pred = self.transformer(
+                            model_input,
+                            t_batch,
+                            timestep_r=timestep_r,
+                            return_dict=False,
+                            **cond_kwargs,
+                        )[0]
+                    guider.cleanup_models(self.transformer)
+
+                noise_pred = guider(guider_state)[0]
+
+                # Scheduler step
                 latents = self.scheduler.step(
                     noise_pred, t, latents, return_dict=False
                 )[0]
