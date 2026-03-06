@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Callable
 
 import torch
@@ -112,10 +111,6 @@ class AceStepPipeline(DiffusionPipeline):
         # sequential CPU offload moves transformer parameters to meta device.
         self._silence_latent = transformer.silence_latent.data.clone()
 
-        self._vae_tiling_enabled = False
-        self._vae_tile_chunk_size = 256
-        self._vae_tile_overlap = 64
-
     @property
     def guidance_scale(self):
         return self._guidance_scale
@@ -123,87 +118,6 @@ class AceStepPipeline(DiffusionPipeline):
     @property
     def num_timesteps(self):
         return self._num_timesteps
-
-    def enable_vae_tiling(self, chunk_size: int = 256, overlap: int = 64):
-        r"""
-        Enable tiled VAE decoding. The VAE decoder splits latents along the temporal axis into overlapping
-        chunks, decodes each independently, trims the overlap, and concatenates. This drastically reduces
-        peak VRAM during decode (the most memory-intensive step in the pipeline).
-
-        Args:
-            chunk_size (`int`, *optional*, defaults to 256):
-                Size of each latent chunk in frames.
-            overlap (`int`, *optional*, defaults to 64):
-                Number of overlapping frames on each side of a chunk. These are decoded but discarded
-                to avoid boundary artifacts from the convolutional decoder.
-        """
-        self._vae_tiling_enabled = True
-        self._vae_tile_chunk_size = chunk_size
-        self._vae_tile_overlap = overlap
-
-    def disable_vae_tiling(self):
-        r"""
-        Disable tiled VAE decoding. If `enable_vae_tiling` was previously enabled, this method will go back to
-        decoding the full latent sequence in one pass.
-        """
-        self._vae_tiling_enabled = False
-
-    def _tiled_vae_decode(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode latents in overlapping temporal chunks to reduce VRAM usage.
-
-        Uses overlap-discard chunking: each chunk is decoded with extra context on both sides,
-        then only the core (non-overlapping) region is kept. This avoids boundary artifacts from
-        the convolutional decoder while keeping peak VRAM proportional to chunk_size.
-
-        Args:
-            latents: Tensor of shape `[B, channels, latent_frames]`.
-
-        Returns:
-            Decoded audio tensor of shape `[B, audio_channels, samples]`.
-        """
-        chunk_size = self._vae_tile_chunk_size
-        overlap = self._vae_tile_overlap
-        latent_frames = latents.shape[-1]
-
-        # Ensure overlap is valid for the chunk size
-        while chunk_size - 2 * overlap <= 0 and overlap > 0:
-            overlap = overlap // 2
-
-        # If the sequence fits in one chunk, decode directly
-        if latent_frames <= chunk_size:
-            return self.vae.decode(latents).sample
-
-        stride = chunk_size - 2 * overlap
-        num_chunks = math.ceil(latent_frames / stride)
-
-        decoded_chunks = []
-        upsample_factor = None
-
-        for i in range(num_chunks):
-            core_start = i * stride
-            core_end = min(core_start + stride, latent_frames)
-            # Expand window by overlap on both sides for context
-            win_start = max(0, core_start - overlap)
-            win_end = min(latent_frames, core_end + overlap)
-
-            latent_chunk = latents[:, :, win_start:win_end]
-            audio_chunk = self.vae.decode(latent_chunk).sample
-
-            # Compute the empirical upsample ratio from the first chunk
-            if upsample_factor is None:
-                upsample_factor = audio_chunk.shape[-1] / latent_chunk.shape[-1]
-
-            # Trim the overlap regions in audio space
-            added_start = core_start - win_start
-            trim_start = int(round(added_start * upsample_factor))
-            added_end = win_end - core_end
-            trim_end = int(round(added_end * upsample_factor))
-
-            audio_len = audio_chunk.shape[-1]
-            end_idx = audio_len - trim_end if trim_end > 0 else audio_len
-            decoded_chunks.append(audio_chunk[:, :, trim_start:end_idx])
-
-        return torch.cat(decoded_chunks, dim=-1)
 
     def check_inputs(
         self,
@@ -680,10 +594,7 @@ class AceStepPipeline(DiffusionPipeline):
         if output_type != "latent":
             # VAE expects [B, channels, time]
             latents_for_vae = latents.transpose(1, 2)
-            if self._vae_tiling_enabled:
-                audio = self._tiled_vae_decode(latents_for_vae)
-            else:
-                audio = self.vae.decode(latents_for_vae).sample
+            audio = self.vae.decode(latents_for_vae).sample
         else:
             self.maybe_free_model_hooks()
             if not return_dict:

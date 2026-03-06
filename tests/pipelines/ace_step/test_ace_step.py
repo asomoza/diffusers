@@ -245,7 +245,7 @@ class AceStepPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         # Use longer duration so the latent sequence exceeds chunk_size and forces actual chunking.
         # vae hop_length=2, sampling_rate=4 => 10s gives 20 latent frames.
         # chunk_size=8, overlap=2 => stride=4 => 5 chunks over 20 frames.
-        pipe.enable_vae_tiling(chunk_size=8, overlap=2)
+        pipe.vae.enable_tiling(chunk_size=8, overlap=2)
         inputs = self.get_dummy_inputs(device)
         inputs["audio_duration_in_s"] = 10.0
         output = pipe(**inputs)
