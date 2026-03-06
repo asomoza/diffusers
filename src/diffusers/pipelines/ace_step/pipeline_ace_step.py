@@ -787,7 +787,7 @@ class AceStepPipeline(DiffusionPipeline):
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
                     latents = callback_outputs.pop("latents", latents)
 
-        # 12. VAE decode
+        # 11. VAE decode
         if output_type != "latent":
             # VAE expects [B, channels, time]
             latents_for_vae = latents.transpose(1, 2)
