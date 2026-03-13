@@ -16,6 +16,7 @@ if is_torch_available():
     from .stable_audio_transformer import StableAudioDiTModel
     from .t5_film_transformer import T5FilmDecoder
     from .transformer_2d import Transformer2DModel
+    from .transformer_ace_step import AceStepTransformer1DModel
     from .transformer_allegro import AllegroTransformer3DModel
     from .transformer_bria import BriaTransformer2DModel
     from .transformer_bria_fibo import BriaFiboTransformer2DModel

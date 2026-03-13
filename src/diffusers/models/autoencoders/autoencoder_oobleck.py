@@ -355,6 +355,33 @@ class AutoencoderOobleck(ModelMixin, AutoencoderMixin, ConfigMixin):
         )
 
         self.use_slicing = False
+        self.use_tiling = False
+        self.tile_chunk_size = 256
+        self.tile_overlap = 64
+
+    def enable_tiling(self, chunk_size: int = 256, overlap: int = 64):
+        r"""
+        Enable tiled VAE decoding. When this option is enabled, the VAE will split the latent tensor into
+        overlapping temporal chunks, decode each independently, trim the overlap, and concatenate. This reduces
+        peak VRAM during decode for long audio sequences.
+
+        Args:
+            chunk_size (`int`, *optional*, defaults to 256):
+                Size of each latent chunk in frames along the temporal axis.
+            overlap (`int`, *optional*, defaults to 64):
+                Number of overlapping frames on each side of a chunk. These are decoded but discarded
+                to avoid boundary artifacts from the convolutional decoder.
+        """
+        self.use_tiling = True
+        self.tile_chunk_size = chunk_size
+        self.tile_overlap = overlap
+
+    def disable_tiling(self):
+        r"""
+        Disable tiled VAE decoding. If `enable_tiling` was previously enabled, this method will go back to
+        computing decoding in one step.
+        """
+        self.use_tiling = False
 
     @apply_forward_hook
     def encode(
@@ -386,12 +413,70 @@ class AutoencoderOobleck(ModelMixin, AutoencoderMixin, ConfigMixin):
         return AutoencoderOobleckOutput(latent_dist=posterior)
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True) -> OobleckDecoderOutput | torch.Tensor:
-        dec = self.decoder(z)
+        if self.use_tiling and z.shape[-1] > self.tile_chunk_size:
+            dec = self._tiled_decode(z)
+        else:
+            dec = self.decoder(z)
 
         if not return_dict:
             return (dec,)
 
         return OobleckDecoderOutput(sample=dec)
+
+    def _tiled_decode(self, z: torch.Tensor) -> torch.Tensor:
+        r"""Decode latents in overlapping temporal chunks to reduce VRAM usage.
+
+        Uses overlap-discard chunking: each chunk is decoded with extra context on both sides,
+        then only the core (non-overlapping) region is kept. This avoids boundary artifacts from
+        the convolutional decoder while keeping peak VRAM proportional to `tile_chunk_size`.
+
+        Args:
+            z (`torch.Tensor` of shape `(batch_size, channels, latent_frames)`):
+                Input latent tensor.
+
+        Returns:
+            `torch.Tensor` of shape `(batch_size, audio_channels, samples)`:
+                Decoded audio tensor.
+        """
+        chunk_size = self.tile_chunk_size
+        overlap = self.tile_overlap
+        latent_frames = z.shape[-1]
+
+        # Ensure overlap is valid for the chunk size
+        while chunk_size - 2 * overlap <= 0 and overlap > 0:
+            overlap = overlap // 2
+
+        stride = chunk_size - 2 * overlap
+        num_chunks = math.ceil(latent_frames / stride)
+
+        decoded_chunks = []
+        upsample_factor = None
+
+        for i in range(num_chunks):
+            core_start = i * stride
+            core_end = min(core_start + stride, latent_frames)
+            # Expand window by overlap on both sides for context
+            win_start = max(0, core_start - overlap)
+            win_end = min(latent_frames, core_end + overlap)
+
+            latent_chunk = z[:, :, win_start:win_end]
+            audio_chunk = self.decoder(latent_chunk)
+
+            # Compute the empirical upsample ratio from the first chunk
+            if upsample_factor is None:
+                upsample_factor = audio_chunk.shape[-1] / latent_chunk.shape[-1]
+
+            # Trim the overlap regions in audio space
+            added_start = core_start - win_start
+            trim_start = int(round(added_start * upsample_factor))
+            added_end = win_end - core_end
+            trim_end = int(round(added_end * upsample_factor))
+
+            audio_len = audio_chunk.shape[-1]
+            end_idx = audio_len - trim_end if trim_end > 0 else audio_len
+            decoded_chunks.append(audio_chunk[:, :, trim_start:end_idx])
+
+        return torch.cat(decoded_chunks, dim=-1)
 
     @apply_forward_hook
     def decode(
