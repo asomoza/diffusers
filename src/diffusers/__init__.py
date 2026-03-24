@@ -269,6 +269,7 @@ else:
             "SD3Transformer2DModel",
             "SkyReelsV2Transformer3DModel",
             "SparseControlNetModel",
+            "AceStepTransformer1DModel",
             "StableAudioDiTModel",
             "StableCascadeUNet",
             "T2IAdapter",
@@ -633,6 +634,7 @@ else:
             "SkyReelsV2DiffusionForcingVideoToVideoPipeline",
             "SkyReelsV2ImageToVideoPipeline",
             "SkyReelsV2Pipeline",
+            "AceStepPipeline",
             "StableAudioPipeline",
             "StableAudioProjectionModel",
             "StableCascadeCombinedPipeline",
@@ -961,6 +963,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             apply_taylorseer_cache,
         )
         from .models import (
+            AceStepTransformer1DModel,
             AllegroTransformer3DModel,
             AsymmetricAutoencoderKL,
             AttentionBackendName,
@@ -1223,6 +1226,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             ZImageModularPipeline,
         )
         from .pipelines import (
+            AceStepPipeline,
             AllegroPipeline,
             AltDiffusionImg2ImgPipeline,
             AltDiffusionPipeline,
